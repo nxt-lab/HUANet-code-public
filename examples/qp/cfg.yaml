@@ -1,0 +1,40 @@
+scenario:
+  id: qp
+  name: quadratic programming
+
+problem:
+  n_var: 10
+  n_eq: 5
+  n_ineq: 5
+  seed: 2026
+
+data:
+  root_subdir: data/QP
+  n_samples: 20000
+  train_percent: 0.8
+  val_percent: 0.1
+  test_percent: 0.1
+
+neural_net:
+  hidden_layers: [512, 512]
+  mode: correction
+
+optimizer:
+  learning_rate: 0.001
+  decay_rate: 0.9
+  transition_steps: 1000
+  weight_decay: 0.0001
+
+training:
+  batch_size: 256
+  n_epochs: 20000
+  n_admm: 40
+  gamma_r: 1.0
+  gamma_s: 10000.0
+  eval_step: 5000
+
+admm:
+  max_iter: 100
+  tolerance: 0.0001
+  rho: 2.0
+
