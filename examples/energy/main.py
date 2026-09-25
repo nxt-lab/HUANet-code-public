@@ -18,12 +18,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from admm.admm import admm
 from dc3.method import run_dc3
-from examples.energy.utils import EnergyPrimeNet, energy_slack_form, energy_slices, equality_rhs, report_benchmark
+from examples.energy.utils import (
+    EnergyPrimeNet,
+    cvxpy_objective,
+    energy_cost,
+    energy_slices,
+    energy_slack_form,
+    equality_rhs,
+    normalize_energy_q,
+    report_benchmark,
+)
 from huanet.neural_layer import HUANet
 from huanet.utils import precompute
 
 jax.config.update("jax_enable_x64", True)
-print(jax.devices())
+
 
 def make_l2o_solver(
     nn_params,
@@ -31,7 +40,8 @@ def make_l2o_solver(
     E: jnp.ndarray,
     E_pinv: jnp.ndarray,
     d_ineq: jnp.ndarray,
-    S_m: float,
+    net_demand: jnp.ndarray,
+    N: int,
     n_var: int,
     n_ineq: int,
     n_admm: int,
@@ -40,206 +50,255 @@ def make_l2o_solver(
     @jax.pmap
     def solve(features_batch: jnp.ndarray, lam_batch: jnp.ndarray) -> jnp.ndarray:
         n_samples = lam_batch.shape[0]
-        b = equality_rhs(lam_batch, lam_batch.shape[-1], S_m)
+        b = equality_rhs(lam_batch, net_demand, N)
         d = jnp.broadcast_to(d_ineq, (n_samples, n_ineq))
         eta = jnp.concatenate([b, d], axis=-1)
-        w_init = jnp.zeros((n_samples, n_ineq))
-        v_init = jnp.zeros_like(w_init)
-        x_init = jnp.zeros((n_samples, n_var))
+        w = jnp.zeros((n_samples, n_ineq))
+        v = jnp.zeros_like(w)
+        x = jnp.zeros((n_samples, n_var))
 
         def body_fn(_, carry):
             w_k, v_k, _ = carry
             q = w_k - v_k / rho
-            x_next, s_next, _ = model.apply({"params": nn_params}, q, features_batch, E, E_pinv, eta)
-            w_next = jnp.maximum(0.0, s_next + v_k / rho)
-            v_next = v_k + rho * (s_next - w_next)
+            q_network = normalize_energy_q(q, model.cfg["problem"])
+            x_next, slack, _ = model.apply(
+                {"params": nn_params}, q_network, features_batch, E, E_pinv, eta
+            )
+            w_next = jnp.maximum(0.0, slack + v_k / rho)
+            v_next = v_k + rho * (slack - w_next)
             return w_next, v_next, x_next
 
-        return jax.lax.fori_loop(0, n_admm, body_fn, (w_init, v_init, x_init))[2]
+        return jax.lax.fori_loop(0, n_admm, body_fn, (w, v, x))[2]
 
     return solve
 
 
 def baseline_solver(
     lam_samples: np.ndarray,
+    net_demand: np.ndarray,
     A: np.ndarray,
     C: np.ndarray,
     d: np.ndarray,
-    problem_cfg: dict,
+    p: dict,
 ) -> tuple[np.ndarray, np.ndarray]:
-    N = int(problem_cfg["N"])
-    _, pb, r = energy_slices(N)
-    m = slice(3 * N + 1, 4 * N + 1)
     x = cp.Variable(A.shape[1])
-    s = cp.Variable(C.shape[0], nonneg=True)
+    slack = cp.Variable(C.shape[0], nonneg=True)
     b = cp.Parameter(A.shape[0])
-    P_B = float(problem_cfg["S_B"]) * x[pb]
-    S_m = float(problem_cfg["S_m"])
-    imported = S_m * x[m]
-    cycling = (1.0 - float(problem_cfg["mu"])) / (2.0 * np.sqrt(float(problem_cfg["mu"])))
-    f = (
-        float(problem_cfg["p_k"]) * float(problem_cfg["Delta_t"]) * cp.sum(imported + cycling * cp.abs(P_B))
-        + float(problem_cfg["p_p"]) * cp.sum(cp.pos(imported))
-        + float(problem_cfg["eta"]) * cp.sum(cp.pos(cp.inv_pos(x[r]) - 1.0))
-    )
-    problem = cp.Problem(cp.Minimize(f), [A @ x == b, C @ x + s == d])
+    problem = cp.Problem(cp.Minimize(cvxpy_objective(x, p)), [A @ x == b, C @ x + slack == d])
+    if not problem.is_dcp():
+        raise ValueError("The smooth energy reference problem is not DCP canonicalizable.")
 
     x_batch, solve_times = [], []
     for lam in lam_samples:
-        rhs = np.zeros(A.shape[0])
-        rhs[N + 1:] = lam[:N] / S_m
-        b.value = rhs
+        b.value = np.asarray(equality_rhs(
+            jnp.asarray(lam).reshape(1, 1), jnp.asarray(net_demand), int(p["N"])
+        ))[0]
         start = time.perf_counter()
         problem.solve(solver=cp.CLARABEL, warm_start=True, verbose=False)
         elapsed = time.perf_counter() - start
-        x_batch.append(np.array(x.value))
+        if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or x.value is None:
+            raise RuntimeError(f"Clarabel reference failed with status {problem.status}.")
+        value = np.asarray(x.value)
+        eq_residual = np.max(np.abs(A @ value - b.value))
+        ineq_residual = np.max(np.maximum(C @ value - d, 0.0))
+        _, _, pc_slice, _ = energy_slices(int(p["N"]))
+        pc = value[pc_slice]
+        if (
+            not np.all(np.isfinite(value))
+            or np.min(pc) < float(p["pc_min"]) - 1e-6
+            or max(eq_residual, ineq_residual) > 1e-5
+        ):
+            raise RuntimeError(
+                f"Invalid Clarabel reference: eq={eq_residual:.3e}, ineq={ineq_residual:.3e}, min_pc={np.min(pc):.3e}."
+            )
+        x_batch.append(value)
         solve_times.append(elapsed)
     return np.stack(x_batch), np.asarray(solve_times)
 
 
-def primal_solver(q, lam, A, C, d, problem_cfg, rho):
-    problem, x, s = energy_slack_form(lam, A, C, d, problem_cfg, q, rho)
+def primal_solver(q, lam, net_demand, A, C, d, p, rho):
+    problem, x, slack = energy_slack_form(lam, net_demand, A, C, d, p, q, rho)
     start = time.perf_counter()
     problem.solve(solver=cp.CLARABEL, warm_start=True, verbose=False)
     elapsed = time.perf_counter() - start
-    if x.value is None or s.value is None:
-        raise RuntimeError(f"Clarabel primal step failed with status {problem.status}")
-    return x.value, s.value, elapsed
+    if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or x.value is None or slack.value is None:
+        raise RuntimeError(f"Clarabel ADMM primal step failed with status {problem.status}.")
+    return np.asarray(x.value), np.asarray(slack.value), elapsed
+
+
+def _validate_metadata(data, saved, p: dict) -> None:
+    expected = {
+        "schema_version": str(p["schema_version"]),
+        "forecast_day": int(p["forecast_day"]),
+        "pc_min": float(p["pc_min"]),
+        "pc_max": float(p["pc_max"]),
+        "m_min": float(p["m_min"]),
+        "m_max": float(p["m_max"]),
+    }
+    for name, value in expected.items():
+        data_value = data[name].item()
+        model_value = saved[name].item()
+        if data_value != value or model_value != value:
+            raise ValueError(f"Metadata mismatch for {name}: dataset={data_value}, model={model_value}, expected={value}.")
+    for name in ("delta", "kappa_m", "kappa_c"):
+        if saved[name].item() != float(p[name]):
+            raise ValueError(f"Checkpoint smoothing parameter {name} does not match configuration.")
+    for name in (
+        "Delta_t", "B", "c_e", "c_p", "c_d", "mu", "a", "delta", "kappa_m", "kappa_c",
+        "u_min", "u_max", "pc_min", "pc_max", "m_min", "m_max", "s_min", "s_max",
+    ):
+        if data[name].item() != float(p[name]):
+            raise ValueError(f"Dataset parameter {name} does not match configuration.")
+    for name in ("A", "C", "d", "net_demand"):
+        if not np.array_equal(data[name], saved[name]):
+            raise ValueError(f"Checkpoint and dataset contain different {name} values.")
+    if data["J_ref"].item() != saved["J_ref"].item() or data["J_ref"].item() <= 0.0:
+        raise ValueError("Checkpoint and dataset contain different or invalid J_ref values.")
 
 
 def main() -> None:
     with Path(__file__).with_name("cfg.yaml").open(encoding="utf-8") as file:
         cfg = yaml.safe_load(file)
 
-    problem_cfg = cfg["problem"]
-    N = int(problem_cfg["N"])
-    n_var, n_eq, n_ineq = 4 * N + 1, 2 * N + 1, 5 * N + 3
+    p = cfg["problem"]
+    N = int(p["N"])
+    n_var, n_eq, n_ineq = int(p["n_var"]), int(p["n_eq"]), int(p["n_ineq"])
     n_samples = int(cfg["data"]["n_samples"])
     scenario_root = Path(__file__).resolve().parents[2] / cfg["data"]["root_subdir"] / f"n_var_{n_var}"
     dataset_path = scenario_root / "datasets" / f"datasets_{n_samples}.npz"
-    model_path = scenario_root / "model_params" / f"huanet_params_{n_samples}_n{n_var}_eq{n_eq}_ineq{n_ineq}.npz"
+    schema_version = str(p["schema_version"])
+    model_path = scenario_root / "model_params" / f"huanet_params_{schema_version}_{n_samples}_n{n_var}_eq{n_eq}_ineq{n_ineq}.npz"
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset not found: {dataset_path}. Run generate.py first.")
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}. Run train.py first.")
 
-    with np.load(dataset_path) as data:
+    with np.load(dataset_path) as data, np.load(model_path, allow_pickle=True) as saved:
+        _validate_metadata(data, saved, p)
         A, C, d = (np.asarray(data[name]) for name in ("A", "C", "d"))
+        net_demand = np.asarray(data["net_demand"])
         lam_all = np.asarray(data["lam"])
         features_all = np.asarray(data["lambda_features"])
         J_ref = float(data["J_ref"])
-    with np.load(model_path, allow_pickle=True) as saved:
         nn_params = saved["params"].item()["nn"]
 
     n_total = len(lam_all)
     n_train = max(1, int(n_total * float(cfg["data"]["train_percent"])))
     n_val = max(1, int(n_total * float(cfg["data"]["val_percent"])))
     n_train = min(n_train, n_total - n_val - 1)
-    test_start = n_train + n_val
-    lam_test_np = lam_all[test_start:]
-    features_test_np = features_all[test_start:]
-    n_test = len(lam_test_np)
-    if not n_test:
-        raise ValueError("The configured dataset has no test samples.")
+    lam_test = lam_all[n_train + n_val:]
+    lam_eval = lam_test
+    features_eval = features_all[n_train + n_val:]
+    n_eval = len(lam_eval)
 
     model_cfg = freeze({
-        "problem": {**problem_cfg, "n_var": n_var, "n_eq": n_eq, "n_ineq": n_ineq},
-        "neural_net": {
-            **cfg["neural_net"],
-            "hidden_layers": tuple(cfg["neural_net"]["hidden_layers"]),
-        },
+        "problem": p,
+        "neural_net": {**cfg["neural_net"], "hidden_layers": tuple(cfg["neural_net"]["hidden_layers"])},
     })
     model = HUANet(model_cfg, prime_net_cls=EnergyPrimeNet)
-    E, E_pinv = precompute(jnp.array(A), jnp.array(C))
-    n_admm = int(cfg["training"]["n_admm"])
-    rho = float(cfg["admm"]["rho"])
+    E, E_pinv = precompute(jnp.asarray(A), jnp.asarray(C))
+    n_admm, rho = int(cfg["training"]["n_admm"]), float(cfg["admm"]["rho"])
     l2o_solve = make_l2o_solver(
-        nn_params=nn_params,
-        model=model,
-        E=E,
-        E_pinv=E_pinv,
-        d_ineq=jnp.array(d),
-        S_m=float(problem_cfg["S_m"]),
-        n_var=n_var,
-        n_ineq=n_ineq,
-        n_admm=n_admm,
-        rho=rho,
+        nn_params, model, E, E_pinv, jnp.asarray(d), jnp.asarray(net_demand), N,
+        n_var, n_ineq, n_admm, rho,
     )
 
     n_devices = jax.local_device_count()
     print(f"Using {n_devices} CPU devices via pmap")
-    pad = (n_devices - n_test % n_devices) % n_devices
-    features = jnp.array(features_test_np)
-    lam = jnp.array(lam_test_np)
+    pad = (n_devices - n_eval % n_devices) % n_devices
+    features = jnp.asarray(features_eval)
+    lam = jnp.asarray(lam_eval)
     if pad:
-        features = jnp.concatenate([features, jnp.zeros((pad, N), dtype=features.dtype)], axis=0)
-        lam = jnp.concatenate([lam, jnp.zeros((pad, N), dtype=lam.dtype)], axis=0)
-    # Warm up
-    print("Running L2O...")
-    features0 = jnp.zeros((n_devices, 1, N), dtype=features.dtype)
-    lam0 = jnp.zeros((n_devices, 1, N), dtype=lam.dtype)
-    _ = l2o_solve(features0, lam0).block_until_ready()
+        lam_padding = jnp.full((pad, 1), 0.65, dtype=lam.dtype)
+        feature_padding = jnp.full((pad, 1), 0.6, dtype=features.dtype)
+        features = jnp.concatenate([features, feature_padding], axis=0)
+        lam = jnp.concatenate([lam, lam_padding], axis=0)
 
-    # Per-batch timing
-    l2o_times = []
-    x_parts = []
-    for i in range(0, len(lam), n_devices):
-        end = i + n_devices
-        features_i = features[i:end, None, :]
-        lam_i = lam[i:end, None, :]
+    warm_features = jnp.full((n_devices, 1, 1), 0.6, dtype=features.dtype)
+    warm_lam = jnp.full((n_devices, 1, 1), 0.65, dtype=lam.dtype)
+    _ = l2o_solve(warm_features, warm_lam).block_until_ready()
+
+    l2o_times, x_parts = [], []
+    for start_index in range(0, len(lam), n_devices):
+        stop_index = start_index + n_devices
+        features_i = features[start_index:stop_index, None, :]
+        lam_i = lam[start_index:stop_index, None, :]
         start = time.perf_counter()
         x_i = l2o_solve(features_i, lam_i)
         x_i.block_until_ready()
         elapsed = time.perf_counter() - start
-        x_parts.append(np.array(x_i[:, 0, :]))
+        x_parts.append(np.asarray(x_i[:, 0, :]))
         l2o_times.extend([elapsed / n_devices] * n_devices)
-
-    x_pred = np.vstack(x_parts)[:n_test]
-    l2o_times = np.array(l2o_times[:n_test], dtype=float)
+    x_pred = np.vstack(x_parts)[:n_eval]
+    l2o_times = np.asarray(l2o_times[:n_eval])
     sequential_time = float(np.mean(l2o_times))
 
-    print("Running DC3...")
-    x_dc3, times_dc3 = run_dc3(lam_test_np, scenario_root)
+    repeated = l2o_solve(
+        warm_features.at[:, 0, :].set(features_eval[0]),
+        warm_lam.at[:, 0, :].set(lam_eval[0]),
+    )
+    repeated.block_until_ready()
+    repeated_np = np.asarray(repeated[:, 0, :])
+    expected_np = np.broadcast_to(x_pred[0], repeated_np.shape)
+    np.testing.assert_allclose(repeated_np, expected_np, rtol=1e-9, atol=1e-9)
 
-    print("Running Clarabel with the exact energy objective...")
-    x_clarabel, times_clarabel = baseline_solver(lam_test_np, A, C, d, problem_cfg)
-    b = np.asarray(equality_rhs(jnp.asarray(lam_test_np), N, float(problem_cfg["S_m"])))
-    d_batch = np.broadcast_to(d, (n_test, n_ineq))
-
-    # ---- ADMM ----
-    x_admm = np.zeros((n_test, n_var))
-    times_admm = np.zeros(n_test)
-    print(f"Running ADMM on {n_test} samples...")
-    for i, lam_i in enumerate(lam_test_np):
-        x_admm[i], times_admm[i] = admm(
-            lambda q: primal_solver(q, lam_i, A, C, d, problem_cfg, rho),
+    print("Running Clarabel with the canonical smooth energy objective...")
+    x_clarabel, times_clarabel = baseline_solver(lam_eval, net_demand, A, C, d, p)
+    b = np.asarray(equality_rhs(jnp.asarray(lam_eval), jnp.asarray(net_demand), N))
+    d_batch = np.broadcast_to(d, (n_eval, n_ineq))
+    objective_huanet = energy_cost(x_pred, p)
+    objective_reference = energy_cost(x_clarabel, p)
+    equality_violation = np.max(np.abs(x_pred @ A.T - b), axis=1)
+    inequality_violation = np.max(np.maximum(x_pred @ C.T - d_batch, 0.0), axis=1)
+    gap_valid = (
+        np.isfinite(objective_huanet)
+        & np.isfinite(objective_reference)
+        & (equality_violation <= 1e-6)
+        & (inequality_violation <= 1e-6)
+    )
+    relative_gap = (
+        np.abs(objective_huanet[gap_valid] - objective_reference[gap_valid])
+        / np.maximum(np.abs(objective_reference[gap_valid]), 1e-10)
+        * 100.0
+    )
+    if relative_gap.size:
+        print(f"HUANet mean optimality gap: {np.mean(relative_gap):.6e}%")
+        print(f"HUANet max optimality gap:  {np.max(relative_gap):.6e}%")
+    else:
+        print("HUANet mean optimality gap: unavailable (no feasible predictions)")
+        print("HUANet max optimality gap:  unavailable (no feasible predictions)")
+    x_admm, times_admm = np.zeros((n_eval, n_var)), np.zeros(n_eval)
+    print(f"Running ADMM on {n_eval} samples...")
+    for index, lam_i in enumerate(lam_eval):
+        x_admm[index], times_admm[index] = admm(
+            lambda q, value=lam_i: primal_solver(q, value, net_demand, A, C, d, p, rho),
             n_ineq=n_ineq,
             max_iter=int(cfg["admm"]["max_iter"]),
             tol=float(cfg["admm"]["tolerance"]),
             rho=rho,
         )
 
-    # ---- Save results ----
+    print("Running DC3 on the identical test instances...")
+    x_dc3, times_dc3 = run_dc3(lam_eval, scenario_root)
+
     benchmark_dir = scenario_root / "benchmark_plots"
     benchmark_dir.mkdir(parents=True, exist_ok=True)
     summary_path = benchmark_dir / f"benchmark_nvar_{n_var}_eq_{n_eq}_ineq_{n_ineq}.npz"
-    np.savez_compressed(
-        benchmark_dir / f"benchmark_nvar_{n_var}_admm.npz",
-        n_var=n_var,
-        admm_y=x_admm,
-        admm_times=times_admm,
-    )
     report_benchmark(
         summary_path,
-        samples={"lam": lam_test_np, "features": features_test_np, "b": b, "d": d_batch},
+        samples={
+            "lam": lam_eval, "features": features_eval, "b": b, "d": d_batch,
+            "net_demand": net_demand,
+        },
         matrices={"A": A, "C": C},
         solvers={
             "clarabel": (x_clarabel, times_clarabel),
             "our_method": (x_pred, l2o_times),
+            "admm": (x_admm, times_admm),
             "dc3": (x_dc3, times_dc3),
         },
         sequential_time=sequential_time,
-        problem_cfg=problem_cfg,
+        p=p,
         J_ref=J_ref,
     )
     print(f"Saved benchmark summary: {summary_path}")

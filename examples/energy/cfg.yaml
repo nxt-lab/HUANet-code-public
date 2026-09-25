@@ -3,44 +3,52 @@ scenario:
   name: energy management
 
 problem:
-  n_var: 385
+  n_param: 1
+  n_var: 384
   n_eq: 193
-  n_ineq: 483
+  n_ineq: 480
   N: 96
   n_state: 1
   m_input: 2
   seed: 2026
   Delta_t: 0.25
-  b_bess: 500.0
-  p_k: 0.1
-  p_p: 19.19
-  eta: 10.0
+  B: 500.0
+  c_e: 0.1
+  c_p: 19.19
+  c_d: 10.0
   mu: 0.8
-  gamma: 50.0
-  S_e: 700.0
-  S_B: 100.0
-  kappa_D: 0.1
-  kappa_g: 10.0
-  delta: 0.7
-  sigma_min: 0.2
-  sigma_max: 0.8
-  B_min: -700.0
-  B_max: 700.0
-  r_min: 0.000001
-  r_ext: 0.02
-  S_m: 100.0
-  sigma_0: 0.5
-  sigma_N_min: 0.5
+  a: 50.0
+  S_u: 700.0
+  S_c: 50.0
+  S_m: 50.0
+  delta: 0.01
+  kappa_m: 10.0
+  kappa_c: 10.0
+  s_min: 0.2
+  s_max: 0.8
+  u_min: -700.0
+  u_max: 700.0
+  pc_min: 0.1
+  pc_max: 10.0
+  m_min: -50.0
+  m_max: 50.0
+  soc_initial_min: 0.25
+  soc_initial_max: 0.75
+  forecast_day: 0
+  schema_version: energy_soc_v5_physical_ineq
 
 data:
-  root_subdir: data/energy
+  source_subdir: data/energy
+  load_file: load/load_7days.csv
+  pv_file: generator/PV_48h_15-min_150kW_San_Diego.csv
+  root_subdir: data/energy_soc_day_0
   n_samples: 20000
   train_percent: 0.8
   val_percent: 0.1
   test_percent: 0.1
 
 neural_net:
-  hidden_layers: [512, 512]
+  hidden_layers: [256, 256]
   mode: correction
 
 optimizer:
@@ -48,21 +56,19 @@ optimizer:
   decay_rate: 0.9
   transition_steps: 1000
   weight_decay: 0.0001
-  grad_clip_norm: 1.0
-  max_consecutive_errors: 1
 
 training:
   batch_size: 256
-  n_epochs: 2000
+  n_epochs: 1000
   n_admm: 40
-  gamma_r: 100.0
+  gamma_r: 1.0
   gamma_p: 1.0
   gamma_c: 1.0
   gamma_s: 1000.0
-  eval_step: 2000
+  eval_step: 5000
 
 admm:
   max_iter: 1000
-  tolerance: 0.001
+  tolerance: 0.01
   rho: 10.0
   solver: CLARABEL

@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from examples.energy.utils import energy_slices, imported_slice
+from examples.energy.utils import energy_slices
 from dc3.utils import EnergyProblem, my_hash, str_to_bool
 
 with (Path(__file__).resolve().parents[2] / "examples" / "energy" / "cfg.yaml").open(encoding="utf-8") as file:
@@ -29,31 +29,26 @@ DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 
 def problem_variable_bounds(problem):
     N = int(problem["N"])
-    e_sl, pb_sl, r_sl = energy_slices(N)
-    n_reduced = 3 * N + 1
-    z_L = np.empty(n_reduced, dtype=np.float64)
-    z_U = np.empty(n_reduced, dtype=np.float64)
-    soc_scale = float(problem["b_bess"]) / float(problem["Delta_t"]) / float(problem["S_e"])
-    e_bound = max(
-        soc_scale * (float(problem["sigma_max"]) - float(problem["sigma_0"])),
-        soc_scale * (float(problem["sigma_0"]) - float(problem["sigma_min"])),
-    )
-    z_L[e_sl] = -e_bound
-    z_U[e_sl] = e_bound
-    z_L[pb_sl] = float(problem["B_min"]) / float(problem["S_B"])
-    z_U[pb_sl] = float(problem["B_max"]) / float(problem["S_B"])
-    z_L[r_sl] = float(problem["r_min"])
-    z_U[r_sl] = np.inf
+    m, u, pc, soc = energy_slices(N)
+    z_L = np.empty(4 * N, dtype=np.float64)
+    z_U = np.empty(4 * N, dtype=np.float64)
+    z_L[m], z_U[m] = float(problem["m_min"]), float(problem["m_max"])
+    z_L[u], z_U[u] = float(problem["u_min"]), float(problem["u_max"])
+    z_L[pc], z_U[pc] = float(problem["pc_min"]), float(problem["pc_max"])
+    z_L[soc], z_U[soc] = float(problem["s_min"]), float(problem["s_max"])
     return z_L, z_U
 
 
 def energy_params(problem, J_ref):
-    keys = ("N", "Delta_t", "p_k", "p_p", "eta", "mu", "gamma", "S_B", "S_m", "r_min")
-    return {**{key: problem[key] for key in keys}, "J_ref": J_ref, "substitute_m": True}
+    keys = (
+        "N", "Delta_t", "c_e", "c_p", "c_d", "mu", "a", "delta",
+        "kappa_m", "kappa_c", "pc_min",
+    )
+    return {**{key: problem[key] for key in keys}, "J_ref": J_ref}
 
 
 def dataset_paths(problem, n_samples):
-    n_var = 4 * int(problem["N"]) + 1
+    n_var = 4 * int(problem["N"])
     root = Path(__file__).resolve().parents[2] / cfg["data"]["root_subdir"] / f"n_var_{n_var}"
     return root / "datasets" / f"datasets_{n_samples}.npz", root
 
@@ -69,11 +64,17 @@ def load_energy_data(args):
 
     z_L, z_U = problem_variable_bounds(problem)
     with np.load(dataset_path) as dataset:
-        b_all = dataset["lam"][:, :N]
-        A = dataset["A"][:N + 1, :3 * N + 1]
-        C = dataset["C"][:, :3 * N + 1]
+        if dataset["schema_version"].item() != str(problem["schema_version"]):
+            raise ValueError("DC3 dataset schema does not match the energy configuration.")
+        b_all = dataset["lam"]
+        A = dataset["A"]
+        C = dataset["C"]
         d = dataset["d"]
+        net_demand = dataset["net_demand"]
         params = energy_params(problem, float(dataset["J_ref"]))
+    expected = ((2 * N + 1, 4 * N), (5 * N, 4 * N), (5 * N,))
+    if (A.shape, C.shape, d.shape) != expected:
+        raise ValueError(f"DC3 energy dimensions {(A.shape, C.shape, d.shape)} do not match {expected}.")
 
     data = EnergyProblem(
         A=A,
@@ -83,6 +84,7 @@ def load_energy_data(args):
         z_L=z_L,
         z_U=z_U,
         params=params,
+        net_demand=net_demand,
         train_percent=float(args["trainPercent"]),
         val_percent=float(args["valPercent"]),
         device=DEVICE,
@@ -101,10 +103,10 @@ def main():
     parser.add_argument("--hiddenSize", type=int)
     parser.add_argument("--softWeight", type=float, default=1000.0)
     parser.add_argument("--softWeightEqFrac", type=float, default=0.5)
-    parser.add_argument("--useCompl", type=str_to_bool, default=False)
+    parser.add_argument("--useCompl", type=str_to_bool, default=True)
     parser.add_argument("--useTrainCorr", type=str_to_bool, default=True)
     parser.add_argument("--useTestCorr", type=str_to_bool, default=True)
-    parser.add_argument("--corrMode", type=str, default="full", choices=["partial", "full"])
+    parser.add_argument("--corrMode", type=str, default="partial", choices=["partial", "full"])
     parser.add_argument("--corrTrainSteps", type=int, default=5)
     parser.add_argument("--corrTestMaxSteps", type=int, default=20)
     parser.add_argument("--corrEps", type=float, default=1e-4)
@@ -116,7 +118,7 @@ def main():
     args = vars(parser.parse_args())
 
     training_cfg = cfg["training"]
-    args["epochs"] = int(args["epochs"] or training_cfg.get("n_epochs", 1000))
+    args["epochs"] = int(args["epochs"] or training_cfg.get("n_epochs", 500))
     args["batchSize"] = int(args["batchSize"] or training_cfg.get("batch_size", 256))
     args["hiddenSize"] = int(args["hiddenSize"] or cfg["neural_net"]["hidden_layers"][0])
 
@@ -299,7 +301,11 @@ def _grad_steps(data, X, Y, args, steps):
             raise NotImplementedError
 
         new_step = args["corrLr"] * Y_step + args["corrMomentum"] * old_step
-        Y_new = Y_new - new_step
+        if args["corrMode"] == "partial":
+            partial = Y_new[:, data.partial_vars] - new_step
+            Y_new = data.complete_physical_partial(X, partial)
+        else:
+            Y_new = Y_new - new_step
         old_step = new_step
     return Y_new
 
@@ -333,6 +339,9 @@ class NNSolver(nn.Module):
             if isinstance(layer, nn.Linear):
                 nn.init.kaiming_normal_(layer.weight)
                 nn.init.zeros_(layer.bias)
+        output_layer = self.net[-2] if args["useCompl"] else self.net[-1]
+        nn.init.zeros_(output_layer.weight)
+        nn.init.zeros_(output_layer.bias)
 
     def forward(self, x):
         out = self.net(x)
@@ -342,13 +351,8 @@ class NNSolver(nn.Module):
 
 
 def expand_reduced_solution(z_reduced, lam, problem):
-    N = int(problem["N"])
-    _, pb, r = energy_slices(N)
-    x = np.empty((len(z_reduced), 4 * N + 1), dtype=np.float64)
-    x[:, :3 * N + 1] = z_reduced
-    P_B = float(problem["S_B"]) * z_reduced[:, pb]
-    x[:, imported_slice(N)] = (lam[:, :N] + float(problem["gamma"]) * z_reduced[:, r] - P_B) / float(problem["S_m"])
-    return x
+    del lam, problem
+    return np.asarray(z_reduced)
 
 
 def run_dc3(lam_test, root):
