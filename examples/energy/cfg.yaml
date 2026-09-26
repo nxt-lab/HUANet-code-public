@@ -48,7 +48,7 @@ data:
   test_percent: 0.1
 
 neural_net:
-  hidden_layers: [256, 256]
+  hidden_layers: [512, 512]
   mode: correction
 
 optimizer:
@@ -72,3 +72,24 @@ admm:
   tolerance: 0.01
   rho: 10.0
   solver: CLARABEL
+
+dc3:
+  device: cpu
+  epochs: 500
+  batch_size: 2
+  learning_rate: 0.001
+  hidden_size: 256
+  dropout: 0.2
+  soft_weight: 1000.0
+  soft_weight_eq_fraction: 0.5
+  use_completion: true
+  use_train_correction: true
+  use_test_correction: true
+  correction_mode: partial
+  correction_train_steps: 5
+  correction_test_max_steps: 200
+  correction_tolerance: 0.0001
+  correction_learning_rate: 0.00001
+  correction_momentum: 0.0
+  results_save_frequency: 100
+  print_frequency: 100

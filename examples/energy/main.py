@@ -166,21 +166,23 @@ def main() -> None:
     n_samples = int(cfg["data"]["n_samples"])
     scenario_root = Path(__file__).resolve().parents[2] / cfg["data"]["root_subdir"] / f"n_var_{n_var}"
     dataset_path = scenario_root / "datasets" / f"datasets_{n_samples}.npz"
-    schema_version = str(p["schema_version"])
-    model_path = scenario_root / "model_params" / f"huanet_params_{schema_version}_{n_samples}_n{n_var}_eq{n_eq}_ineq{n_ineq}.npz"
+    # L2O temporarily disabled:
+    # schema_version = str(p["schema_version"])
+    # model_path = scenario_root / "model_params" / f"huanet_params_{schema_version}_{n_samples}_n{n_var}_eq{n_eq}_ineq{n_ineq}.npz"
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset not found: {dataset_path}. Run generate.py first.")
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model not found: {model_path}. Run train.py first.")
+    # if not model_path.exists():
+    #     raise FileNotFoundError(f"Model not found: {model_path}. Run train.py first.")
+    # with np.load(dataset_path) as data, np.load(model_path, allow_pickle=True) as saved:
+    #     _validate_metadata(data, saved, p)
+    #     nn_params = saved["params"].item()["nn"]
 
-    with np.load(dataset_path) as data, np.load(model_path, allow_pickle=True) as saved:
-        _validate_metadata(data, saved, p)
+    with np.load(dataset_path) as data:
         A, C, d = (np.asarray(data[name]) for name in ("A", "C", "d"))
         net_demand = np.asarray(data["net_demand"])
         lam_all = np.asarray(data["lam"])
         features_all = np.asarray(data["lambda_features"])
         J_ref = float(data["J_ref"])
-        nn_params = saved["params"].item()["nn"]
 
     n_total = len(lam_all)
     n_train = max(1, int(n_total * float(cfg["data"]["train_percent"])))
@@ -191,95 +193,111 @@ def main() -> None:
     features_eval = features_all[n_train + n_val:]
     n_eval = len(lam_eval)
 
-    model_cfg = freeze({
-        "problem": p,
-        "neural_net": {**cfg["neural_net"], "hidden_layers": tuple(cfg["neural_net"]["hidden_layers"])},
-    })
-    model = HUANet(model_cfg, prime_net_cls=EnergyPrimeNet)
-    E, E_pinv = precompute(jnp.asarray(A), jnp.asarray(C))
-    n_admm, rho = int(cfg["training"]["n_admm"]), float(cfg["admm"]["rho"])
-    l2o_solve = make_l2o_solver(
-        nn_params, model, E, E_pinv, jnp.asarray(d), jnp.asarray(net_demand), N,
-        n_var, n_ineq, n_admm, rho,
-    )
+    # L2O temporarily disabled:
+    # model_cfg = freeze({
+    #     "problem": p,
+    #     "neural_net": {**cfg["neural_net"], "hidden_layers": tuple(cfg["neural_net"]["hidden_layers"])},
+    # })
+    # model = HUANet(model_cfg, prime_net_cls=EnergyPrimeNet)
+    # E, E_pinv = precompute(jnp.asarray(A), jnp.asarray(C))
+    # n_admm, rho = int(cfg["training"]["n_admm"]), float(cfg["admm"]["rho"])
+    # l2o_solve = make_l2o_solver(
+    #     nn_params, model, E, E_pinv, jnp.asarray(d), jnp.asarray(net_demand), N,
+    #     n_var, n_ineq, n_admm, rho,
+    # )
+    # n_devices = jax.local_device_count()
+    # print(f"Using {n_devices} CPU devices via pmap")
+    # pad = (n_devices - n_eval % n_devices) % n_devices
+    # features = jnp.asarray(features_eval)
+    # lam = jnp.asarray(lam_eval)
+    # if pad:
+    #     lam_padding = jnp.full((pad, 1), 0.65, dtype=lam.dtype)
+    #     feature_padding = jnp.full((pad, 1), 0.6, dtype=features.dtype)
+    #     features = jnp.concatenate([features, feature_padding], axis=0)
+    #     lam = jnp.concatenate([lam, lam_padding], axis=0)
+    # warm_features = jnp.full((n_devices, 1, 1), 0.6, dtype=features.dtype)
+    # warm_lam = jnp.full((n_devices, 1, 1), 0.65, dtype=lam.dtype)
+    # _ = l2o_solve(warm_features, warm_lam).block_until_ready()
+    # l2o_times, x_parts = [], []
+    # for start_index in range(0, len(lam), n_devices):
+    #     stop_index = start_index + n_devices
+    #     features_i = features[start_index:stop_index, None, :]
+    #     lam_i = lam[start_index:stop_index, None, :]
+    #     start = time.perf_counter()
+    #     x_i = l2o_solve(features_i, lam_i)
+    #     x_i.block_until_ready()
+    #     elapsed = time.perf_counter() - start
+    #     x_parts.append(np.asarray(x_i[:, 0, :]))
+    #     l2o_times.extend([elapsed / n_devices] * n_devices)
+    # x_pred = np.vstack(x_parts)[:n_eval]
+    # l2o_times = np.asarray(l2o_times[:n_eval])
+    # sequential_time = float(np.mean(l2o_times))
 
-    n_devices = jax.local_device_count()
-    print(f"Using {n_devices} CPU devices via pmap")
-    pad = (n_devices - n_eval % n_devices) % n_devices
-    features = jnp.asarray(features_eval)
-    lam = jnp.asarray(lam_eval)
-    if pad:
-        lam_padding = jnp.full((pad, 1), 0.65, dtype=lam.dtype)
-        feature_padding = jnp.full((pad, 1), 0.6, dtype=features.dtype)
-        features = jnp.concatenate([features, feature_padding], axis=0)
-        lam = jnp.concatenate([lam, lam_padding], axis=0)
-
-    warm_features = jnp.full((n_devices, 1, 1), 0.6, dtype=features.dtype)
-    warm_lam = jnp.full((n_devices, 1, 1), 0.65, dtype=lam.dtype)
-    _ = l2o_solve(warm_features, warm_lam).block_until_ready()
-
-    l2o_times, x_parts = [], []
-    for start_index in range(0, len(lam), n_devices):
-        stop_index = start_index + n_devices
-        features_i = features[start_index:stop_index, None, :]
-        lam_i = lam[start_index:stop_index, None, :]
-        start = time.perf_counter()
-        x_i = l2o_solve(features_i, lam_i)
-        x_i.block_until_ready()
-        elapsed = time.perf_counter() - start
-        x_parts.append(np.asarray(x_i[:, 0, :]))
-        l2o_times.extend([elapsed / n_devices] * n_devices)
-    x_pred = np.vstack(x_parts)[:n_eval]
-    l2o_times = np.asarray(l2o_times[:n_eval])
-    sequential_time = float(np.mean(l2o_times))
-
-    repeated = l2o_solve(
-        warm_features.at[:, 0, :].set(features_eval[0]),
-        warm_lam.at[:, 0, :].set(lam_eval[0]),
-    )
-    repeated.block_until_ready()
-    repeated_np = np.asarray(repeated[:, 0, :])
-    expected_np = np.broadcast_to(x_pred[0], repeated_np.shape)
-    np.testing.assert_allclose(repeated_np, expected_np, rtol=1e-9, atol=1e-9)
+    # repeated = l2o_solve(
+    #     warm_features.at[:, 0, :].set(features_eval[0]),
+    #     warm_lam.at[:, 0, :].set(lam_eval[0]),
+    # )
+    # repeated.block_until_ready()
+    # repeated_np = np.asarray(repeated[:, 0, :])
+    # expected_np = np.broadcast_to(x_pred[0], repeated_np.shape)
+    # np.testing.assert_allclose(repeated_np, expected_np, rtol=1e-9, atol=1e-9)
 
     print("Running Clarabel with the canonical smooth energy objective...")
     x_clarabel, times_clarabel = baseline_solver(lam_eval, net_demand, A, C, d, p)
     b = np.asarray(equality_rhs(jnp.asarray(lam_eval), jnp.asarray(net_demand), N))
     d_batch = np.broadcast_to(d, (n_eval, n_ineq))
-    objective_huanet = energy_cost(x_pred, p)
-    objective_reference = energy_cost(x_clarabel, p)
-    equality_violation = np.max(np.abs(x_pred @ A.T - b), axis=1)
-    inequality_violation = np.max(np.maximum(x_pred @ C.T - d_batch, 0.0), axis=1)
-    gap_valid = (
-        np.isfinite(objective_huanet)
-        & np.isfinite(objective_reference)
-        & (equality_violation <= 1e-6)
-        & (inequality_violation <= 1e-6)
-    )
-    relative_gap = (
-        np.abs(objective_huanet[gap_valid] - objective_reference[gap_valid])
-        / np.maximum(np.abs(objective_reference[gap_valid]), 1e-10)
-        * 100.0
-    )
-    if relative_gap.size:
-        print(f"HUANet mean optimality gap: {np.mean(relative_gap):.6e}%")
-        print(f"HUANet max optimality gap:  {np.max(relative_gap):.6e}%")
-    else:
-        print("HUANet mean optimality gap: unavailable (no feasible predictions)")
-        print("HUANet max optimality gap:  unavailable (no feasible predictions)")
-    x_admm, times_admm = np.zeros((n_eval, n_var)), np.zeros(n_eval)
-    print(f"Running ADMM on {n_eval} samples...")
-    for index, lam_i in enumerate(lam_eval):
-        x_admm[index], times_admm[index] = admm(
-            lambda q, value=lam_i: primal_solver(q, value, net_demand, A, C, d, p, rho),
-            n_ineq=n_ineq,
-            max_iter=int(cfg["admm"]["max_iter"]),
-            tol=float(cfg["admm"]["tolerance"]),
-            rho=rho,
-        )
+    # L2O metric block temporarily disabled; restore it with the inference block above.
+    # objective_huanet = energy_cost(x_pred, p)
+    # objective_reference = energy_cost(x_clarabel, p)
+    # equality_violation = np.max(np.abs(x_pred @ A.T - b), axis=1)
+    # inequality_violation = np.max(np.maximum(x_pred @ C.T - d_batch, 0.0), axis=1)
+    # gap_valid = (
+    #     np.isfinite(objective_huanet)
+    #     & np.isfinite(objective_reference)
+    #     & (equality_violation <= 1e-6)
+    #     & (inequality_violation <= 1e-6)
+    # )
+    # relative_gap = (
+    #     np.abs(objective_huanet[gap_valid] - objective_reference[gap_valid])
+    #     / np.maximum(np.abs(objective_reference[gap_valid]), 1e-10)
+    #     * 100.0
+    # )
+    # if relative_gap.size:
+    #     print(f"HUANet mean optimality gap: {np.mean(relative_gap):.6e}%")
+    #     print(f"HUANet max optimality gap:  {np.max(relative_gap):.6e}%")
+    # else:
+    #     print("HUANet mean optimality gap: unavailable (no feasible predictions)")
+    #     print("HUANet max optimality gap:  unavailable (no feasible predictions)")
+
+    # ADMM temporarily disabled:
+    # x_admm, times_admm = np.zeros((n_eval, n_var)), np.zeros(n_eval)
+    # print(f"Running ADMM on {n_eval} samples...")
+    # for index, lam_i in enumerate(lam_eval):
+    #     x_admm[index], times_admm[index] = admm(
+    #         lambda q, value=lam_i: primal_solver(q, value, net_demand, A, C, d, p, rho),
+    #         n_ineq=n_ineq,
+    #         max_iter=int(cfg["admm"]["max_iter"]),
+    #         tol=float(cfg["admm"]["tolerance"]),
+    #         rho=rho,
+    #     )
 
     print("Running DC3 on the identical test instances...")
     x_dc3, times_dc3 = run_dc3(lam_eval, scenario_root)
+    objective_dc3 = energy_cost(x_dc3, p)
+    objective_clarabel = energy_cost(x_clarabel, p)
+    dc3_relative_gap = (
+        np.abs(objective_dc3 - objective_clarabel)
+        / np.maximum(np.abs(objective_clarabel), np.finfo(float).eps)
+        * 100.0
+    )
+    dc3_eq_violation = np.max(np.abs(x_dc3 @ A.T - b), axis=1)
+    dc3_ineq_violation = np.max(np.maximum(x_dc3 @ C.T - d_batch, 0.0), axis=1)
+    print(f"DC3 mean optimality gap:    {np.mean(dc3_relative_gap):.6e}%")
+    print(f"DC3 mean eq violation:      {np.mean(dc3_eq_violation):.6e}")
+    print(f"DC3 mean ineq violation:    {np.mean(dc3_ineq_violation):.6e}")
+    print(f"DC3 max ineq violation:     {np.max(dc3_ineq_violation):.6e}")
+    print(f"DC3 mean solve time:        {1e3 * np.mean(times_dc3):.6e} ms")
+    print(f"DC3 max solve time:         {1e3 * np.max(times_dc3):.6e} ms")
 
     benchmark_dir = scenario_root / "benchmark_plots"
     benchmark_dir.mkdir(parents=True, exist_ok=True)
@@ -293,11 +311,12 @@ def main() -> None:
         matrices={"A": A, "C": C},
         solvers={
             "clarabel": (x_clarabel, times_clarabel),
-            "our_method": (x_pred, l2o_times),
-            "admm": (x_admm, times_admm),
+            # "our_method": (x_pred, l2o_times),  # L2O temporarily disabled.
+            # "admm": (x_admm, times_admm),       # ADMM temporarily disabled.
             "dc3": (x_dc3, times_dc3),
         },
-        sequential_time=sequential_time,
+        # Restore sequential_time=sequential_time when L2O is enabled.
+        sequential_time=None,
         p=p,
         J_ref=J_ref,
     )

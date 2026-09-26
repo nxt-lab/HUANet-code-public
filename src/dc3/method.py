@@ -24,7 +24,12 @@ with (Path(__file__).resolve().parents[2] / "examples" / "energy" / "cfg.yaml").
     cfg = yaml.safe_load(file)
 
 torch.set_default_dtype(torch.float64)
-DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+dc3_cfg = cfg["dc3"]
+configured_device = str(dc3_cfg.get("device", "cpu"))
+if configured_device == "auto":
+    DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+else:
+    DEVICE = torch.device(configured_device)
 
 
 def problem_variable_bounds(problem):
@@ -32,9 +37,9 @@ def problem_variable_bounds(problem):
     m, u, pc, soc = energy_slices(N)
     z_L = np.empty(4 * N, dtype=np.float64)
     z_U = np.empty(4 * N, dtype=np.float64)
-    z_L[m], z_U[m] = float(problem["m_min"]), float(problem["m_max"])
+    z_L[m], z_U[m] = -np.inf, np.inf
     z_L[u], z_U[u] = float(problem["u_min"]), float(problem["u_max"])
-    z_L[pc], z_U[pc] = float(problem["pc_min"]), float(problem["pc_max"])
+    z_L[pc], z_U[pc] = float(problem["pc_min"]), np.inf
     z_L[soc], z_U[soc] = float(problem["s_min"]), float(problem["s_max"])
     return z_L, z_U
 
@@ -42,7 +47,7 @@ def problem_variable_bounds(problem):
 def energy_params(problem, J_ref):
     keys = (
         "N", "Delta_t", "c_e", "c_p", "c_d", "mu", "a", "delta",
-        "kappa_m", "kappa_c", "pc_min",
+        "kappa_m", "kappa_c", "pc_min", "soc_initial_min", "soc_initial_max",
     )
     return {**{key: problem[key] for key in keys}, "J_ref": J_ref}
 
@@ -66,7 +71,7 @@ def load_energy_data(args):
     with np.load(dataset_path) as dataset:
         if dataset["schema_version"].item() != str(problem["schema_version"]):
             raise ValueError("DC3 dataset schema does not match the energy configuration.")
-        b_all = dataset["lam"]
+        features = dataset["lambda_features"]
         A = dataset["A"]
         C = dataset["C"]
         d = dataset["d"]
@@ -80,7 +85,7 @@ def load_energy_data(args):
         A=A,
         C=C,
         d=d,
-        b_all=b_all,
+        features=features,
         z_L=z_L,
         z_U=z_U,
         params=params,
@@ -97,30 +102,55 @@ def main():
     parser.add_argument("--nSamples", type=int, default=int(cfg["data"]["n_samples"]))
     parser.add_argument("--trainPercent", type=float, default=float(cfg["data"]["train_percent"]))
     parser.add_argument("--valPercent", type=float, default=float(cfg["data"]["val_percent"]))
-    parser.add_argument("--epochs", type=int)
-    parser.add_argument("--batchSize", type=int)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--hiddenSize", type=int)
-    parser.add_argument("--softWeight", type=float, default=1000.0)
-    parser.add_argument("--softWeightEqFrac", type=float, default=0.5)
-    parser.add_argument("--useCompl", type=str_to_bool, default=True)
-    parser.add_argument("--useTrainCorr", type=str_to_bool, default=True)
-    parser.add_argument("--useTestCorr", type=str_to_bool, default=True)
-    parser.add_argument("--corrMode", type=str, default="partial", choices=["partial", "full"])
-    parser.add_argument("--corrTrainSteps", type=int, default=5)
-    parser.add_argument("--corrTestMaxSteps", type=int, default=20)
-    parser.add_argument("--corrEps", type=float, default=1e-4)
-    parser.add_argument("--corrLr", type=float, default=1e-5)
-    parser.add_argument("--corrMomentum", type=float, default=0.0)
-    parser.add_argument("--resultsSaveFreq", type=int, default=100)
-    parser.add_argument("--printFreq", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=int(dc3_cfg["epochs"]))
+    parser.add_argument("--batchSize", type=int, default=int(dc3_cfg["batch_size"]))
+    parser.add_argument("--lr", type=float, default=float(dc3_cfg["learning_rate"]))
+    parser.add_argument("--hiddenSize", type=int, default=int(dc3_cfg["hidden_size"]))
+    parser.add_argument("--dropout", type=float, default=float(dc3_cfg["dropout"]))
+    parser.add_argument("--softWeight", type=float, default=float(dc3_cfg["soft_weight"]))
+    parser.add_argument(
+        "--softWeightEqFrac", type=float, default=float(dc3_cfg["soft_weight_eq_fraction"])
+    )
+    parser.add_argument("--useCompl", type=str_to_bool, default=bool(dc3_cfg["use_completion"]))
+    parser.add_argument(
+        "--useTrainCorr", type=str_to_bool, default=bool(dc3_cfg["use_train_correction"])
+    )
+    parser.add_argument(
+        "--useTestCorr", type=str_to_bool, default=bool(dc3_cfg["use_test_correction"])
+    )
+    parser.add_argument(
+        "--corrMode", type=str, default=str(dc3_cfg["correction_mode"]),
+        choices=["partial", "full"],
+    )
+    parser.add_argument(
+        "--corrTrainSteps", type=int, default=int(dc3_cfg["correction_train_steps"])
+    )
+    parser.add_argument(
+        "--corrTestMaxSteps", type=int, default=int(dc3_cfg["correction_test_max_steps"])
+    )
+    parser.add_argument(
+        "--corrEps", type=float, default=float(dc3_cfg["correction_tolerance"])
+    )
+    parser.add_argument(
+        "--corrLr", type=float, default=float(dc3_cfg["correction_learning_rate"])
+    )
+    parser.add_argument(
+        "--corrMomentum", type=float, default=float(dc3_cfg["correction_momentum"])
+    )
+    parser.add_argument(
+        "--resultsSaveFreq", type=int, default=int(dc3_cfg["results_save_frequency"])
+    )
+    parser.add_argument("--printFreq", type=int, default=int(dc3_cfg["print_frequency"]))
     parser.add_argument("--seed", type=int, default=int(cfg["problem"]["seed"]))
     args = vars(parser.parse_args())
-
-    training_cfg = cfg["training"]
-    args["epochs"] = int(args["epochs"] or training_cfg.get("n_epochs", 500))
-    args["batchSize"] = int(args["batchSize"] or training_cfg.get("batch_size", 256))
-    args["hiddenSize"] = int(args["hiddenSize"] or cfg["neural_net"]["hidden_layers"][0])
+    if not args["useCompl"]:
+        raise ValueError("Energy DC3 requires equality completion (use_completion: true).")
+    if args["corrMode"] != "partial":
+        raise ValueError("Energy DC3 uses reduced-space correction (correction_mode: partial).")
+    if not 0.0 <= args["softWeightEqFrac"] <= 1.0:
+        raise ValueError("soft_weight_eq_fraction must lie in [0, 1].")
+    if not 0.0 <= args["dropout"] < 1.0:
+        raise ValueError("DC3 dropout must lie in [0, 1).")
 
     torch.manual_seed(args["seed"])
     np.random.seed(args["seed"])
@@ -171,11 +201,10 @@ def train_net(data, args, save_dir):
             Yhat_train = solver_net(Xtrain)
             Ynew_train = grad_steps(data, Xtrain, Yhat_train, args)
             train_loss = total_loss(data, Xtrain, Ynew_train, args)
-            train_loss = torch.mean(train_loss)
-            train_loss.backward()
+            train_loss.sum().backward()
             solver_opt.step()
 
-            dict_agg(epoch_stats, "train_loss", train_loss.detach().cpu().item(), op="sum")
+            dict_agg(epoch_stats, "train_loss", train_loss.detach().cpu().numpy())
             dict_agg(epoch_stats, "train_time", time.time() - start_time, op="sum")
 
         if i % args["resultsSaveFreq"] == 0:
@@ -192,8 +221,9 @@ def train_net(data, args, save_dir):
 
         if i % args["printFreq"] == 0:
             valid_stats = stats.get(i) or eval_net(data, data.validX, solver_net, args, prefix="valid")
+            mean_train_loss = np.mean(epoch_stats.get("train_loss", np.asarray([np.nan])))
             print(
-                f"Epoch {i:5d} | train loss: {epoch_stats.get('train_loss', float('nan')):.6e} | "
+                f"Epoch {i:5d} | train loss: {mean_train_loss:.6e} | "
                 f"valid obj: {valid_stats['valid_obj']:.6e} | "
                 f"eq: {valid_stats['valid_eq_max']:.6e} | "
                 f"ineq: {valid_stats['valid_ineq_max']:.6e}"
@@ -270,6 +300,7 @@ def grad_steps(data, X, Y, args):
     return Y
 
 
+@torch.no_grad()
 def grad_steps_all(data, X, Y, args):
     if not args["useTestCorr"]:
         return Y, 0
@@ -294,18 +325,14 @@ def _grad_steps(data, X, Y, args, steps):
             Y_step = data.ineq_partial_grad(X, Y_new)
         elif args["corrMode"] == "full":
             Y_step = (
-                args["softWeight"] * args["softWeightEqFrac"] * data.eq_grad(X, Y_new)
-                + args["softWeight"] * (1.0 - args["softWeightEqFrac"]) * data.ineq_grad(X, Y_new)
+                args["softWeightEqFrac"] * data.eq_grad(X, Y_new)
+                + (1.0 - args["softWeightEqFrac"]) * data.ineq_grad(X, Y_new)
             )
         else:
             raise NotImplementedError
 
         new_step = args["corrLr"] * Y_step + args["corrMomentum"] * old_step
-        if args["corrMode"] == "partial":
-            partial = Y_new[:, data.partial_vars] - new_step
-            Y_new = data.complete_physical_partial(X, partial)
-        else:
-            Y_new = Y_new - new_step
+        Y_new = Y_new - new_step
         old_step = new_step
     return Y_new
 
@@ -323,29 +350,32 @@ class NNSolver(nn.Module):
                     nn.Linear(a, b),
                     nn.BatchNorm1d(b),
                     nn.ReLU(),
-                    nn.Dropout(p=0.2),
+                    nn.Dropout(p=args["dropout"]),
                 ]
                 for a, b in zip(layer_sizes[0:-1], layer_sizes[1:])
             ],
         )
         output_dim = data.ydim - data.nknowns
         if args["useCompl"]:
-            layers += [nn.Linear(layer_sizes[-1], output_dim), nn.Sigmoid()]
-        else:
-            layers += [nn.Linear(layer_sizes[-1], output_dim)]
+            output_dim -= data.neq
+        layers += [nn.Linear(layer_sizes[-1], output_dim)]
         self.net = nn.Sequential(*layers)
 
         for layer in self.net:
             if isinstance(layer, nn.Linear):
                 nn.init.kaiming_normal_(layer.weight)
                 nn.init.zeros_(layer.bias)
-        output_layer = self.net[-2] if args["useCompl"] else self.net[-1]
+        output_layer = self.net[-1]
         nn.init.zeros_(output_layer.weight)
         nn.init.zeros_(output_layer.bias)
+        if args["useCompl"]:
+            pc_start = int(data.params["N"]) - 1
+            pc_target = float(data.params["a"]) - float(data.params["pc_min"])
+            output_layer.bias.data[pc_start:] = torch.log(torch.expm1(torch.tensor(pc_target)))
 
     def forward(self, x):
         out = self.net(x)
-        if self._data.nknowns > 0:
+        if self._data.neq > 0:
             return self._data.complete_partial(x, out)
         return self._data.process_output(x, out)
 
@@ -355,6 +385,13 @@ def expand_reduced_solution(z_reduced, lam, problem):
     return np.asarray(z_reduced)
 
 
+def _sync_device():
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    elif DEVICE.type == "mps":
+        torch.mps.synchronize()
+
+
 def run_dc3(lam_test, root):
     checkpoints = list((root / "dc3" / "method").rglob("solver_net.dict"))
     if not checkpoints:
@@ -362,30 +399,42 @@ def run_dc3(lam_test, root):
     checkpoint = max(checkpoints, key=lambda path: path.stat().st_mtime)
     with (checkpoint.parent / "args.dict").open("rb") as file:
         args = pickle.load(file)
-    args["corrTestMaxSteps"] = 200
-    args["corrEps"] = 1e-5
+    args.setdefault("dropout", float(dc3_cfg["dropout"]))
 
     data, _ = load_energy_data(args)
-    if data.testX.shape != lam_test.shape or not np.array_equal(data.testX.cpu().numpy(), lam_test):
+    test_x0 = data.raw_x0(data.testX).cpu().numpy()
+    if test_x0.shape != lam_test.shape or not np.allclose(test_x0, lam_test, rtol=0.0, atol=1e-15):
         raise ValueError("DC3 checkpoint and energy benchmark use different test samples.")
 
     model = NNSolver(data, args).to(DEVICE)
     model.load_state_dict(torch.load(checkpoint, map_location=DEVICE, weights_only=True))
     model.eval()
+
+    # Match DC3_draft's evaluation protocol: warm up once, then time the exact
+    # batch=1 end-to-end solve used to produce every reported test solution.
     with torch.no_grad():
-        start = time.perf_counter()
-        raw = model(data.testX)
-        if DEVICE.type == "cuda":
-            torch.cuda.synchronize()
-        y, steps = grad_steps_all(data, data.testX, raw, args)
-        if DEVICE.type == "cuda":
-            torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
+        first_x = data.testX[:1]
+        for _ in range(10):
+            first_raw = model(first_x)
+            grad_steps_all(data, first_x, first_raw, args)
+
+        solutions, steps, times = [], [], []
+        for index in range(data.n_test):
+            x_i = data.testX[index:index + 1]
+            _sync_device()
+            start = time.perf_counter()
+            raw_i = model(x_i)
+            y_i, steps_i = grad_steps_all(data, x_i, raw_i, args)
+            _sync_device()
+            times.append(time.perf_counter() - start)
+            solutions.append(y_i.cpu())
+            steps.append(steps_i)
+        y = torch.cat(solutions, dim=0)
 
     print(f"DC3 checkpoint: {checkpoint}")
-    print(f"DC3 correction steps: {steps}")
+    print(f"DC3 correction steps: mean={np.mean(steps):.2f}, max={np.max(steps)}")
     x = expand_reduced_solution(y.cpu().numpy(), lam_test, cfg["problem"])
-    return x, np.full(len(x), elapsed / len(x))
+    return x, np.asarray(times)
 
 
 if __name__ == "__main__":

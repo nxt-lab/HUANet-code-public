@@ -315,6 +315,7 @@ def benchmark_metrics(
     return {
         "Mean signed obj difference": float(np.nanmean(signed)) if np.any(valid) else float("nan"),
         "Mean obj gap (%)": float(np.nanmean(relative)) if np.any(valid) else float("nan"),
+        "Max obj gap (%)": float(np.nanmax(relative)) if np.any(valid) else float("nan"),
         "Valid gap samples": int(np.count_nonzero(valid)),
         "Infeasible prediction samples": int(np.count_nonzero(~prediction_valid)),
         "Mean eq violation": float(np.mean(eq_error)),
@@ -326,8 +327,13 @@ def benchmark_metrics(
         "Max power balance residual": float(np.max(physical["power_balance_max"])),
         "Minimum physical pc": float(np.min(physical["minimum_pc"])),
         "pc entries below pc_min": int(physical["pc_below_min_count"]),
-        "Mean solve time (s)": float(np.mean(run_time)),
-        "Max solve time (s)": float(np.max(run_time)),
+        "Mean solve time (ms)": float(1e3 * np.mean(run_time)),
+        "Std solve time (ms)": float(1e3 * np.std(run_time, ddof=1)) if len(run_time) > 1 else 0.0,
+        "Median solve time (ms)": float(1e3 * np.median(run_time)),
+        "P10 solve time (ms)": float(1e3 * np.percentile(run_time, 10)),
+        "P90 solve time (ms)": float(1e3 * np.percentile(run_time, 90)),
+        "Min solve time (ms)": float(1e3 * np.min(run_time)),
+        "Max solve time (ms)": float(1e3 * np.max(run_time)),
     }
 
 
@@ -366,10 +372,9 @@ def print_metrics_table(title: str, metrics: dict[str, float | int]) -> None:
 
 
 def report_benchmark(summary_path, samples, matrices, solvers, sequential_time, p, J_ref) -> None:
-    all_solvers = [
-        ("clarabel", *solvers["clarabel"], "Clarabel (reference)"),
-        ("our_method", *solvers["our_method"], "HUANet Metrics (vs Clarabel)"),
-    ]
+    all_solvers = [("clarabel", *solvers["clarabel"], "Clarabel (reference)")]
+    if "our_method" in solvers:
+        all_solvers.append(("our_method", *solvers["our_method"], "HUANet Metrics (vs Clarabel)"))
     if "admm" in solvers:
         all_solvers.append(("admm", *solvers["admm"], "ADMM Metrics (vs Clarabel)"))
     if "dc3" in solvers:
@@ -378,8 +383,9 @@ def report_benchmark(summary_path, samples, matrices, solvers, sequential_time, 
         **samples,
         "n_var": matrices["A"].shape[1],
         "J_ref": J_ref,
-        "our_method_sequential_time": sequential_time,
     }
+    if sequential_time is not None:
+        save_dict["our_method_sequential_time"] = sequential_time
     results = {}
     for prefix, y, times, _ in all_solvers:
         result = compute_metrics(y, times, solvers["clarabel"][0], samples, matrices, p)
