@@ -75,7 +75,7 @@ def _draw_boxes(ax, t: dict, box_width: float = 0.5) -> None:
 def plot_grouped_box(all_data: list[dict], output_path: str | None = None) -> None:
     plt.rcParams.update(RC)
 
-    fig, axes = plt.subplots(1, len(all_data), figsize=(2.5 * len(all_data), 2.35),
+    fig, axes = plt.subplots(1, len(all_data), figsize=(2.5 * len(all_data), 3.14),
                               sharey=False)
     if len(all_data) == 1:
         axes = [axes]
