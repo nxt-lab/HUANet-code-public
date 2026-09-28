@@ -16,6 +16,7 @@ from flax.core import freeze
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+from admm.admm import admm
 from examples.energy.utils import (
     EnergyPrimeNet,
     cvxpy_objective,
@@ -111,6 +112,31 @@ def baseline_solver(
         x_batch.append(value)
         solve_times.append(elapsed)
     return np.stack(x_batch), np.asarray(solve_times)
+
+
+def make_primal_solver(A, C, d, p, rho):
+    """Reuse one parameterized CVXPY problem across ADMM steps and samples."""
+    x = cp.Variable(A.shape[1])
+    slack = cp.Variable(C.shape[0])
+    q_param = cp.Parameter(C.shape[0])
+    b_param = cp.Parameter(A.shape[0])
+    objective = cvxpy_objective(x, p) + 0.5 * rho * cp.sum_squares(slack - q_param)
+    problem = cp.Problem(cp.Minimize(objective), [A @ x == b_param, C @ x + slack == d])
+    if not problem.is_dcp(dpp=True):
+        raise ValueError("The energy ADMM subproblem must support cached parameter updates.")
+
+    def solve(q, b):
+        q_param.value = q
+        b_param.value = b
+        # Match the QP benchmark: time the solve call, excluding parameter setup.
+        start = time.perf_counter()
+        problem.solve(solver=cp.CLARABEL, warm_start=True, verbose=False, enforce_dpp=True)
+        elapsed = time.perf_counter() - start
+        if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or x.value is None or slack.value is None:
+            raise RuntimeError(f"Clarabel ADMM primal step failed with status {problem.status}.")
+        return np.asarray(x.value), np.asarray(slack.value), elapsed
+
+    return solve
 
 
 def _validate_metadata(data, saved, p: dict) -> None:
@@ -253,9 +279,55 @@ def main() -> None:
         print("HUANet mean optimality gap: unavailable (no feasible predictions)")
         print("HUANet max optimality gap:  unavailable (no feasible predictions)")
 
+    # ---- Vanilla ADMM ----
+    x_admm = np.zeros((n_eval, n_var))
+    times_admm = np.zeros(n_eval)
+    max_iter = int(cfg["admm"]["max_iter"])
+    print(f"Running vanilla ADMM on {n_eval} samples (up to {max_iter} iterations each)...", flush=True)
+    admm_start = time.perf_counter()
+    primal_solve = make_primal_solver(A, C, d, p, rho)
+    for i, b_i in enumerate(b):
+        sample_start = time.perf_counter()
+        iterations = 0
+
+        def solve_primal(q):
+            nonlocal iterations
+            result = primal_solve(q, b_i)
+            iterations += 1
+            if iterations % 100 == 0:
+                print(
+                    f"  ADMM sample {i + 1}/{n_eval}: iteration {iterations}/{max_iter}, "
+                    f"{time.perf_counter() - sample_start:.1f}s elapsed",
+                    flush=True,
+                )
+            return result
+
+        x_admm[i], times_admm[i] = admm(
+            solve_primal,
+            n_ineq=n_ineq,
+            max_iter=max_iter,
+            tol=float(cfg["admm"]["tolerance"]),
+            rho=rho,
+        )
+        sample_wall_time = time.perf_counter() - sample_start
+        elapsed = time.perf_counter() - admm_start
+        remaining = elapsed / (i + 1) * (n_eval - i - 1)
+        print(
+            f"ADMM {i + 1}/{n_eval}: {iterations} iterations, "
+            f"{times_admm[i]:.2f}s benchmark time, {sample_wall_time:.2f}s wall time; "
+            f"elapsed {elapsed / 60:.1f} min, estimated remaining {remaining / 60:.1f} min",
+            flush=True,
+        )
+
     benchmark_dir = scenario_root / "benchmark_plots"
     benchmark_dir.mkdir(parents=True, exist_ok=True)
     summary_path = benchmark_dir / f"benchmark_nvar_{n_var}_eq_{n_eq}_ineq_{n_ineq}.npz"
+    np.savez_compressed(
+        benchmark_dir / f"benchmark_nvar_{n_var}_admm.npz",
+        n_var=n_var,
+        admm_y=x_admm,
+        admm_times=times_admm,
+    )
     report_benchmark(
         summary_path,
         samples={
@@ -266,6 +338,7 @@ def main() -> None:
         solvers={
             "clarabel": (x_clarabel, times_clarabel),
             "our_method": (x_pred, l2o_times),
+            "admm": (x_admm, times_admm),
         },
         sequential_time=sequential_time,
         p=p,
